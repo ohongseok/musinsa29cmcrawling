@@ -1,4 +1,4 @@
-""""Realtime Product Link Matcher Pro (Musinsa / 29CM).
+"""Realtime Product Link Matcher Pro (Musinsa / 29CM).
 
 실행:
     streamlit run product_link_matcher.py
@@ -102,6 +102,7 @@ def fetch_html(
 
         try:
             with sync_playwright() as p:
+                # 봇 차단 화면을 눈으로 확인하고 싶다면 headless=False 로 변경하세요.
                 browser = p.chromium.launch(headless=True)
                 context = browser.new_context()
                 page = context.new_page()
@@ -129,17 +130,19 @@ def fetch_html(
 def extract_candidate_urls(html: str, platform: str) -> list[str]:
     """검색 HTML 전체에서 상품 URL 후보를 폭넓게 추출."""
     if platform == "musinsa":
+        # 수정됨: 무신사 신규 URL 패턴(/app/goods/) 추가
         pattern = re.compile(
-            r"(https?://(?:www\.)?musinsa\.com/products/\d+|/products/\d+)",
+            r"(https?://(?:www\.)?musinsa\.com/(?:app/goods|products)/\d+|/(?:app/goods|products)/\d+)",
             flags=re.IGNORECASE,
         )
         base = "https://www.musinsa.com"
     else:
+        # 수정됨: 29CM product. 서브도메인 및 /catalog/ 패턴 추가
         pattern = re.compile(
-            r"(https?://(?:www\.|shop\.)?29cm\.co\.kr/(?:products|catalog)/\d+|/(?:products|catalog)/\d+)",
+            r"(https?://(?:product\.|www\.|shop\.)?29cm\.co\.kr/(?:catalog|products|product)/\d+|/(?:catalog|products|product)/\d+)",
             flags=re.IGNORECASE,
         )
-        base = "https://www.29cm.co.kr"
+        base = "https://product.29cm.co.kr"
 
     urls = []
     for raw in pattern.findall(html):
@@ -233,13 +236,15 @@ def parse_product_meta(html: str) -> tuple[str, str]:
 
 def extract_urls_from_bing_html(html: str, platform: str) -> list[str]:
     if platform == "musinsa":
+        # 수정됨: 빙 검색 결과에서도 app/goods 허용
         pattern = re.compile(
-            r"https?://(?:www\.)?musinsa\.com/products/\d+",
+            r"https?://(?:www\.)?musinsa\.com/(?:app/goods|products)/\d+",
             flags=re.IGNORECASE,
         )
     else:
+        # 수정됨: 빙 검색 결과에서도 product. 서브도메인 및 /catalog/ 허용
         pattern = re.compile(
-            r"https?://(?:www\.|shop\.)?29cm\.co\.kr/(?:products|catalog)/\d+",
+            r"https?://(?:product\.|www\.|shop\.)?29cm\.co\.kr/(?:catalog|products|product)/\d+",
             flags=re.IGNORECASE,
         )
 
@@ -267,9 +272,9 @@ def fallback_search_via_bing(
     cookie: str | None,
 ) -> list[str]:
     if platform == "musinsa":
-        q = f"site:musinsa.com/products {input_name}"
+        q = f"site:musinsa.com/app/goods OR site:musinsa.com/products {input_name}"
     else:
-        q = f"site:29cm.co.kr/products {input_name}"
+        q = f"site:product.29cm.co.kr/catalog {input_name}"
 
     url = BING_SEARCH_URL.format(q=quote_plus(q))
     status, html, _ = fetch_html(
@@ -520,4 +525,3 @@ def render_app() -> None:
 
 if __name__ == "__main__":
     render_app()
-
