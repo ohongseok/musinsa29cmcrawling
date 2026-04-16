@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import json
 import re
 from typing import Iterable
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -82,37 +82,66 @@ def build_session(cookie: str | None = None) -> requests.Session:
     return s
 
 
-def extract_links_and_titles(html: str, platform: str) -> list[tuple[str, str]]:
-    results: list[tuple[str, str]] = []
-
+def extract_candidate_urls(html: str, platform: str) -> list[str]:
+    """검색 HTML 전체에서 상품 URL 후보를 폭넓게 추출."""
     if platform == "musinsa":
-        href_pattern = r"(?P<href>/products/\d+|https?://(?:www\.)?musinsa\.com/products/\d+)"
+        pattern = re.compile(
+            r"(https?://(?:www\.)?musinsa\.com/products/\d+|/products/\d+)",
+            flags=re.IGNORECASE,
+        )
+        base = "https://www.musinsa.com"
     else:
-        href_pattern = r"(?P<href>/products/\d+|/catalog/\d+|https?://(?:www\.|shop\.)?29cm\.co\.kr/(?:products|catalog)/\d+)"
+        pattern = re.compile(
+            r"(https?://(?:www\.|shop\.)?29cm\.co\.kr/(?:products|catalog)/\d+|/(?:products|catalog)/\d+)",
+            flags=re.IGNORECASE,
+        )
+        base = "https://www.29cm.co.kr"
 
-    pattern = re.compile(
-        rf"<a[^>]*href=[\"']{href_pattern}[\"'][^>]*>(?P<title>.*?)</a>",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+    urls = []
+    for raw in pattern.findall(html):
+        full = urljoin(base, raw)
+        # URL 정규화 (쿼리스트링 제거)
+        p = urlparse(full)
+        normalized = f"{p.scheme}://{p.netloc}{p.path}"
+        urls.append(normalized)
 
-    for m in pattern.finditer(html):
-        href = m.group("href")
-        title = re.sub(r"<[^>]+>", " ", m.group("title"))
-        title = normalize_text(title)
-        if href:
-            results.append((href, title))
-
-    # 중복 제거
     dedup = []
     seen = set()
-    for href, title in results:
-        key = (href, title)
-        if key in seen:
+    for u in urls:
+        if u in seen:
             continue
-        seen.add(key)
-        dedup.append((href, title))
-
+        seen.add(u)
+        dedup.append(u)
     return dedup
+
+
+def parse_detail_title(html: str) -> str:
+    og = re.search(
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if og:
+        return normalize_text(og.group(1))
+
+    title = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if title:
+        return normalize_text(title.group(1))
+
+    for block in re.findall(
+        r"<script[^>]+application/ld\+json[^>]*>(.*?)</script>",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    ):
+        try:
+            payload = json.loads(block.strip())
+        except Exception:
+            continue
+        entries = payload if isinstance(payload, list) else [payload]
+        for item in entries:
+            if isinstance(item, dict) and item.get("name"):
+                return normalize_text(str(item["name"]))
+    return ""
 
 
 def parse_product_meta(html: str) -> tuple[str, str]:
@@ -164,6 +193,7 @@ def fetch_best_match(
     platform: str,
     timeout: int,
     min_confidence: float,
+    max_candidates: int,
 ) -> PlatformMatch:
     search_templates = MUSINSA_SEARCH_URLS if platform == "musinsa" else CM29_SEARCH_URLS
 
@@ -191,43 +221,42 @@ def fetch_best_match(
                 last_error = f"{platform} search {r.status_code}"
                 continue
 
-            pairs = extract_links_and_titles(r.text, platform)
-            if not pairs:
+            candidate_urls = extract_candidate_urls(r.text, platform)
+            if not candidate_urls:
                 last_error = "상품 링크 패턴 미검출"
                 continue
 
             scored = []
-            for href, title in pairs:
-                score = similarity(input_name, title or input_name)
-                scored.append((score, href, title))
+            for full_url in candidate_urls[:max_candidates]:
+                detail_html = ""
+                try:
+                    dr = session.get(full_url, timeout=timeout)
+                    if dr.status_code >= 400:
+                        continue
+                    detail_html = dr.text
+                except Exception:
+                    continue
+
+                title = parse_detail_title(detail_html) or input_name
+                score = similarity(input_name, title)
+                price, stock = parse_product_meta(detail_html)
+                scored.append((score, full_url, title, price, stock))
 
             scored.sort(reverse=True, key=lambda x: x[0])
-            best_score, best_href, best_title = scored[0]
+            if not scored:
+                last_error = "후보 상세 조회 실패"
+                continue
+            best_score, best_url, best_title, best_price, best_stock = scored[0]
 
             if best_score < min_confidence:
                 last_error = f"유사도 부족({best_score:.2f})"
                 continue
 
-            if platform == "musinsa":
-                full_url = urljoin("https://www.musinsa.com", best_href)
-            else:
-                full_url = urljoin("https://www.29cm.co.kr", best_href)
-
             base.matched_name = best_title or input_name
-            base.product_url = full_url
+            base.product_url = best_url
             base.confidence = best_score
-
-            # 상세 페이지로 가격/재고
-            try:
-                dr = session.get(full_url, timeout=timeout)
-                if dr.status_code < 400:
-                    price, stock = parse_product_meta(dr.text)
-                    base.current_price = price
-                    base.stock_status = stock
-                else:
-                    base.error = f"detail {dr.status_code}"
-            except Exception as exc:
-                base.error = f"detail error: {exc}"
+            base.current_price = best_price
+            base.stock_status = best_stock
 
             return base
 
@@ -243,9 +272,12 @@ def run_realtime_matching(
     names: Iterable[str],
     timeout: int,
     min_confidence: float,
-    cookie: str | None,
+    musinsa_cookie: str | None,
+    cm29_cookie: str | None,
+    max_candidates: int,
 ) -> pd.DataFrame:
-    session = build_session(cookie)
+    musinsa_session = build_session(musinsa_cookie)
+    cm29_session = build_session(cm29_cookie)
     rows = []
 
     for name in names:
@@ -253,8 +285,12 @@ def run_realtime_matching(
         if not n:
             continue
 
-        m = fetch_best_match(session, n, "musinsa", timeout, min_confidence)
-        c = fetch_best_match(session, n, "29cm", timeout, min_confidence)
+        m = fetch_best_match(
+            musinsa_session, n, "musinsa", timeout, min_confidence, max_candidates
+        )
+        c = fetch_best_match(
+            cm29_session, n, "29cm", timeout, min_confidence, max_candidates
+        )
 
         status = "both_matched" if (m.product_url and c.product_url) else "partial_or_none"
 
@@ -286,14 +322,24 @@ def render_app() -> None:
     st.caption("실시간 사이트 조회 방식: 상품명 입력 → 링크/가격/재고 추출 (없으면 공란)")
 
     st.info(
-        "차단/로그인 이슈가 있으면 쿠키가 필요할 수 있습니다.\n"
-        "필요 시 브라우저 DevTools에서 Request Cookie를 전달해주세요."
+        "차단/로그인 이슈가 있으면 플랫폼별 쿠키가 필요할 수 있습니다.\n"
+        "쿠키는 노출 즉시 무효화/재발급하세요(보안 중요)."
     )
 
     with st.sidebar:
         timeout = st.slider("요청 타임아웃(초)", 5, 20, 10)
         min_conf = st.slider("최소 유사도", 0.10, 0.95, 0.45, 0.01)
-        cookie = st.text_area("선택: Cookie 헤더", height=120, placeholder="ex) sessionid=...; other=...")
+        max_candidates = st.slider("후보 상세 조회 개수", 3, 25, 10)
+        cm29_cookie = st.text_area(
+            "29CM Cookie (선택)",
+            height=100,
+            placeholder="ex) access_token=...; cf_clearance=...;",
+        )
+        musinsa_cookie = st.text_area(
+            "무신사 Cookie (선택)",
+            height=100,
+            placeholder="ex) mss_mac=...; cf_clearance=...;",
+        )
 
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -324,7 +370,14 @@ def render_app() -> None:
             st.stop()
 
         with st.spinner(f"{len(names)}개 조회 중..."):
-            out = run_realtime_matching(names, timeout=timeout, min_confidence=min_conf, cookie=cookie or None)
+            out = run_realtime_matching(
+                names,
+                timeout=timeout,
+                min_confidence=min_conf,
+                musinsa_cookie=musinsa_cookie or None,
+                cm29_cookie=cm29_cookie or None,
+                max_candidates=max_candidates,
+            )
 
         if out.empty:
             st.warning("결과가 없습니다.")
@@ -343,4 +396,5 @@ def render_app() -> None:
 
 if __name__ == "__main__":
     render_app()
+
 
