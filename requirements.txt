@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+gspread
+google-auth
+requests
+plotly
+openpyxl
+matplotlib
