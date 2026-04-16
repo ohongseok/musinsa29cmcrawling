@@ -1,4 +1,4 @@
-"""Realtime Product Link Matcher Pro (Musinsa / 29CM).
+""""Realtime Product Link Matcher Pro (Musinsa / 29CM).
 
 실행:
     streamlit run product_link_matcher.py
@@ -82,6 +82,48 @@ def build_session(cookie: str | None = None) -> requests.Session:
     if cookie:
         s.headers.update({"Cookie": cookie.strip()})
     return s
+
+
+def fetch_html(
+    url: str,
+    timeout: int,
+    mode: str,
+    session: requests.Session | None = None,
+    cookie: str | None = None,
+) -> tuple[int, str, str]:
+    """HTML fetch helper.
+    Returns: (status_code, html, error_message)
+    """
+    if mode == "playwright":
+        try:
+            from playwright.sync_api import sync_playwright  # optional dependency
+        except Exception as exc:
+            return 0, "", f"playwright import 실패: {exc}"
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context()
+                page = context.new_page()
+                headers = dict(REQUEST_HEADERS)
+                if cookie:
+                    headers["Cookie"] = cookie.strip()
+                page.set_extra_http_headers(headers)
+                page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+                html = page.content()
+                browser.close()
+                return 200, html, ""
+        except Exception as exc:
+            return 0, "", f"playwright fetch 실패: {exc}"
+
+    # default: requests
+    if session is None:
+        session = build_session(cookie)
+    try:
+        r = session.get(url, timeout=timeout)
+        return r.status_code, r.text, ""
+    except Exception as exc:
+        return 0, "", f"requests fetch 실패: {exc}"
 
 
 def extract_candidate_urls(html: str, platform: str) -> list[str]:
@@ -217,10 +259,12 @@ def extract_urls_from_bing_html(html: str, platform: str) -> list[str]:
 
 
 def fallback_search_via_bing(
-    session: requests.Session,
+    session: requests.Session | None,
     input_name: str,
     platform: str,
     timeout: int,
+    mode: str,
+    cookie: str | None,
 ) -> list[str]:
     if platform == "musinsa":
         q = f"site:musinsa.com/products {input_name}"
@@ -228,19 +272,23 @@ def fallback_search_via_bing(
         q = f"site:29cm.co.kr/products {input_name}"
 
     url = BING_SEARCH_URL.format(q=quote_plus(q))
-    r = session.get(url, timeout=timeout)
-    if r.status_code >= 400:
+    status, html, _ = fetch_html(
+        url, timeout=timeout, mode=mode, session=session, cookie=cookie
+    )
+    if status >= 400 or not html:
         return []
-    return extract_urls_from_bing_html(r.text, platform)
+    return extract_urls_from_bing_html(html, platform)
 
 
 def fetch_best_match(
-    session: requests.Session,
+    session: requests.Session | None,
     input_name: str,
     platform: str,
     timeout: int,
     min_confidence: float,
     max_candidates: int,
+    mode: str,
+    cookie: str | None,
 ) -> PlatformMatch:
     search_templates = MUSINSA_SEARCH_URLS if platform == "musinsa" else CM29_SEARCH_URLS
 
@@ -263,16 +311,21 @@ def fetch_best_match(
         search_url = template.format(q=quote_plus(input_name))
         base.search_url = search_url
         try:
-            r = session.get(search_url, timeout=timeout)
-            if r.status_code >= 400:
-                last_error = f"{platform} search {r.status_code}"
+            status, search_html, fetch_err = fetch_html(
+                search_url, timeout=timeout, mode=mode, session=session, cookie=cookie
+            )
+            if status >= 400:
+                last_error = f"{platform} search {status}"
+                continue
+            if not search_html:
+                last_error = fetch_err or f"{platform} search html empty"
                 continue
 
-            candidate_urls = extract_candidate_urls(r.text, platform)
+            candidate_urls = extract_candidate_urls(search_html, platform)
             if not candidate_urls:
                 # 플랫폼 검색페이지에서 못 찾으면 검색엔진 fallback
                 candidate_urls = fallback_search_via_bing(
-                    session, input_name, platform, timeout
+                    session, input_name, platform, timeout, mode, cookie
                 )
                 if not candidate_urls:
                     last_error = "상품 링크 패턴 미검출"
@@ -282,10 +335,12 @@ def fetch_best_match(
             for full_url in candidate_urls[:max_candidates]:
                 detail_html = ""
                 try:
-                    dr = session.get(full_url, timeout=timeout)
-                    if dr.status_code >= 400:
+                    d_status, d_html, _ = fetch_html(
+                        full_url, timeout=timeout, mode=mode, session=session, cookie=cookie
+                    )
+                    if d_status >= 400 or not d_html:
                         continue
-                    detail_html = dr.text
+                    detail_html = d_html
                 except Exception:
                     continue
 
@@ -327,6 +382,7 @@ def run_realtime_matching(
     musinsa_cookie: str | None,
     cm29_cookie: str | None,
     max_candidates: int,
+    mode: str,
 ) -> pd.DataFrame:
     musinsa_session = build_session(musinsa_cookie)
     cm29_session = build_session(cm29_cookie)
@@ -338,10 +394,24 @@ def run_realtime_matching(
             continue
 
         m = fetch_best_match(
-            musinsa_session, n, "musinsa", timeout, min_confidence, max_candidates
+            musinsa_session,
+            n,
+            "musinsa",
+            timeout,
+            min_confidence,
+            max_candidates,
+            mode=mode,
+            cookie=musinsa_cookie,
         )
         c = fetch_best_match(
-            cm29_session, n, "29cm", timeout, min_confidence, max_candidates
+            cm29_session,
+            n,
+            "29cm",
+            timeout,
+            min_confidence,
+            max_candidates,
+            mode=mode,
+            cookie=cm29_cookie,
         )
 
         status = "both_matched" if (m.product_url and c.product_url) else "partial_or_none"
@@ -382,6 +452,7 @@ def render_app() -> None:
         timeout = st.slider("요청 타임아웃(초)", 5, 20, 10)
         min_conf = st.slider("최소 유사도", 0.10, 0.95, 0.45, 0.01)
         max_candidates = st.slider("후보 상세 조회 개수", 3, 25, 10)
+        mode = st.selectbox("조회 모드", ["requests", "playwright"], index=0)
         cm29_cookie = st.text_area(
             "29CM Cookie (선택)",
             height=100,
@@ -429,6 +500,7 @@ def render_app() -> None:
                 musinsa_cookie=musinsa_cookie or None,
                 cm29_cookie=cm29_cookie or None,
                 max_candidates=max_candidates,
+                mode=mode,
             )
 
         if out.empty:
@@ -448,3 +520,4 @@ def render_app() -> None:
 
 if __name__ == "__main__":
     render_app()
+
